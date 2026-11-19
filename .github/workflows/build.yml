@@ -1,0 +1,142 @@
+# SouthsideNextGen 自动构建
+#   MC 1.21.4 / Java 21 / fabric-loom 1.13.6 / Gradle 8.14（build.sh 里写的最小要求）
+#   产物：build/libs/Southside-2.0.1-rebuilt.jar（remapJar，可直接丢进 mods）
+#         build/libs/Southside-2.0.1-dev.jar    （jar，未 remap 的开发版）
+#
+# 原仓库没有任何 workflow，本文件为外部添加。手动触发可覆盖 Gradle/JDK 版本与任务，
+# 便于在不改代码的前提下排查 "Loom 与 Gradle 版本不匹配" 这类问题。
+name: build
+
+on:
+  push:
+    branches: ['master', 'main']
+  pull_request:
+    branches: ['master', 'main']
+  workflow_dispatch:
+    inputs:
+      gradle_version:
+        description: 'Gradle 版本；填 wrapper 则用仓库自带 gradlew（9.0.0）'
+        required: false
+        default: '8.14'
+      java_version:
+        description: 'JDK 大版本'
+        required: false
+        default: '21'
+      gradle_task:
+        description: '要执行的 Gradle 任务'
+        required: false
+        default: 'clean build'
+      make_release:
+        description: '成功后发 Release，填 tag 名（如 v2.0.1）；留空则只产 artifact'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      GRADLE_VERSION: ${{ inputs.gradle_version || '8.14' }}
+      JAVA_VERSION: ${{ inputs.java_version || '21' }}
+      GRADLE_TASK: ${{ inputs.gradle_task || 'clean build' }}
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装 JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: 安装 Gradle
+        if: env.GRADLE_VERSION != 'wrapper'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-read-only: false
+
+      - name: 环境自检
+        run: |
+          set -eux
+          echo "=== 系统 ==="
+          uname -a
+          nproc
+          free -m
+          df -h /
+          echo "=== JDK ==="
+          java -version
+          echo "=== 关键文件 ==="
+          ls -l src/main/resources/southside.accesswidener
+          ls -l mappings/
+          ls -l src/main/resources/META-INF/jars/
+          echo "=== Gradle ==="
+          if [ "$GRADLE_VERSION" = "wrapper" ]; then
+            chmod +x ./gradlew
+            ./gradlew --version
+          else
+            gradle --version
+          fi
+          echo "=== gradle.properties ==="
+          cat gradle.properties
+
+      - name: 编译
+        run: |
+          set -o pipefail
+          if [ "$GRADLE_VERSION" = "wrapper" ]; then
+            ./gradlew --no-daemon --stacktrace $GRADLE_TASK
+          else
+            gradle --no-daemon --stacktrace $GRADLE_TASK
+          fi
+
+      - name: 产物清单
+        if: always()
+        run: |
+          echo "=== build/libs ==="
+          ls -lh build/libs 2>/dev/null || echo "(build/libs 不存在)"
+          echo "=== 本次新生成的 jar ==="
+          find . -name '*.jar' -newermt '-60 minutes' \
+               -not -path './.gradle/*' -printf '%10s  %p\n' 2>/dev/null | sort -k2 || true
+
+      - name: 失败诊断
+        if: failure()
+        run: |
+          set +e
+          echo "=== 依赖解析（compileClasspath）==="
+          if [ "$GRADLE_VERSION" = "wrapper" ]; then
+            ./gradlew --no-daemon dependencies --configuration compileClasspath 2>&1 | tail -300
+          else
+            gradle --no-daemon dependencies --configuration compileClasspath 2>&1 | tail -300
+          fi
+          echo "=== Loom 缓存 ==="
+          du -sh ~/.gradle/caches/fabric-loom 2>/dev/null
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: southside-jars
+          path: build/libs/*.jar
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 发布 Release
+        if: success() && inputs.make_release != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.make_release }}
+          name: ${{ inputs.make_release }}
+          files: build/libs/*.jar
+          generate_release_notes: true
+          fail_on_unmatched_files: false
